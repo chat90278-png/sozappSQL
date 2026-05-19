@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import sys
 import re
+import ctypes
 import getpass
 import os
 import base64
 import copy
 import time
+import traceback
 from pathlib import Path
 from datetime import date, datetime, timedelta
 from typing import Callable, Dict, List, Optional, Tuple
@@ -27,6 +29,8 @@ from src.domain.constants import (
 from src.config.app_config import (
     APP_TITLE,
     APP_ICON_PATH,
+    APP_ICON_ICO_PATH,
+    APP_ID,
     DEFAULT_FILE,
     COMP_SHEET,
     USERS_SHEET,
@@ -58,9 +62,10 @@ from src.ui.theme import STYLE
 from src.ui.tarih import ContractCalendarWindow
 from src.ui.ozet import ContractSummaryDialog
 from src.ui.date_picker import build_date_input as _build_date_input
+from src.ui.kullanim_kilavuzu import UsageGuideDialog
 
 from PySide6.QtCore import Qt, QDate, QObject, QThread, Signal, QTimer, QPoint, QSize, QEvent, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QAction, QCursor, QIntValidator, QCloseEvent
+from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QAction, QCursor, QCloseEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,QGraphicsOpacityEffect, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QListWidget, QListWidgetItem, QTableWidget, QTableWidgetItem,
@@ -69,6 +74,23 @@ from PySide6.QtWidgets import (
     QSizePolicy, QProgressBar, QStyledItemDelegate, QTextEdit,
     QToolButton, QMenu, QInputDialog, QWidgetAction
 )
+
+
+def app_icon_path() -> Path:
+    """Return the native Windows icon when available, otherwise the SVG logo."""
+    if APP_ICON_ICO_PATH.exists():
+        return APP_ICON_ICO_PATH
+    return APP_ICON_PATH
+
+
+def configure_windows_app_identity() -> None:
+    """Set a stable Windows AppUserModelID so taskbar icons use the STS icon."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
+    except Exception:
+        pass
 
 def normalize_sheet_name(name: str) -> str:
     txt = str(name or "").strip().lower()
@@ -2394,7 +2416,7 @@ class TagManagerDialog(StyledDialog):
     def _is_draft_key(self, key: str) -> bool:
         return str(key or "").startswith("__draft__:")
 
-    def _make_unique_draft_name(self, base: str = "0 sözleşme") -> str:
+    def _make_unique_draft_name(self, base: str = "Yeni Etiket") -> str:
         used = {self._tag_key(t.name) for t in self.tags}
         used.update(self._tag_key(v.name) for v in self._draft_tags.values())
         name = base
@@ -2539,6 +2561,7 @@ class TagManagerDialog(StyledDialog):
         self.store.upsert_tag_def(tag)
         if old_name and self._tag_key(old_name) != self._tag_key(name):
             self.store.rename_tag_assignments(old_name, name, tag.color)
+            self.store.delete_tag_def(old_name)
         if is_draft and self.selected_tag_key:
             self._draft_tags.pop(self.selected_tag_key, None)
             self._draft_order = [k for k in self._draft_order if k != self.selected_tag_key]
@@ -2607,6 +2630,8 @@ class SystemDialog(StyledDialog):
         self.external_events_provider = events_provider
         # pre_selected: edit modunda hangi bilesenlerin secili gosterilecegi
         self.pre_selected: Optional[set] = set(pre_selected) if pre_selected is not None else None
+        initial_keys = pre_selected if pre_selected is not None else (getattr(existing_system, "components", {}) or {}).keys()
+        self.initial_component_keys = set(initial_keys or [])
         self.result: Optional[SystemInfo] = None
         try:
             self.system_types = list(self.store.list_system_type_names(self.platform))
@@ -2636,11 +2661,11 @@ class SystemDialog(StyledDialog):
         date_lay.setVerticalSpacing(6)
         self.t0_date, self.t0_date_wrap = build_date_input(self, events_provider=self.date_picker_events)
 
-        # Yeni sistem eklerken ana sözleşmenin T0 tarihi default gelsin.
-        # Düzenleme modunda ise sistemin mevcut T0 tarihi korunsun.
+        # Yeni sistem eklerken ilgili sözleşme/SD T0 tarihi default gelsin.
+        # Düzenleme modunda sistemde kayıtlı T0 varsa korunur; yoksa yine ilgili
+        # sözleşme/SD T0 tarihi önerilir ve kullanıcı değiştirebilir.
         initial_t0_date = str(getattr(self.existing_system, "t0_date", "") or "").strip()
-
-        if not initial_t0_date and not self.edit_mode:
+        if not initial_t0_date:
             initial_t0_date = self.default_t0_date
 
         self.t0_date.setText(initial_t0_date)
@@ -2957,7 +2982,26 @@ class SystemDialog(StyledDialog):
             QMessageBox.warning(self, "Tarih hatası", "T0 Başlangıç Tarihi yyyy-aa-gg formatında olmalı. Örn: 2026-05-02")
             return
         old = self.existing_system.components if (self.edit_mode and self.existing_system) else {}
-        comps = {comp: old.get(comp, 0.0) for comp, cb in self.inputs.items() if cb.isChecked()}
+        selected = set(self.selected_components())
+        removed = []
+        if self.edit_mode and self.existing_system:
+            removed = sorted(self.initial_component_keys - selected, key=lambda x: str(x).lower())
+            if removed:
+                shown = "\n".join(f"• {name}" for name in removed[:12])
+                if len(removed) > 12:
+                    shown += f"\n• ... ve {len(removed) - 12} bileşen daha"
+                answer = QMessageBox.question(
+                    self,
+                    "Bileşenler Silinecek",
+                    "Aşağıdaki bileşenlerin onay kutusunu kaldırdınız. Güncelleme sonrası bu bileşenler "
+                    "sistemden ve bu sisteme ait kabullerden silinecek; Excel'deki ilgili değer hücreleri boşaltılacak.\n\n"
+                    f"{shown}\n\nOnaylıyor musunuz?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if answer != QMessageBox.Yes:
+                    return
+        comps = {comp: old.get(comp, 0.0) for comp in self.inputs.keys() if comp in selected}
         if not comps:
             QMessageBox.warning(self, "Eksik", "En az bir bileşen seçin.")
             return
@@ -2971,6 +3015,7 @@ class SystemDialog(StyledDialog):
             status=getattr(self.existing_system, "status", "Başlanmadı") or "Başlanmadı",
             acceptance_date=getattr(self.existing_system, "acceptance_date", "") or "",
         )
+        self.result.removed_components = set(removed)
         self.accept()
 
 
@@ -2994,7 +3039,7 @@ class MultiSystemDialog(StyledDialog):
         self.drafts: List[dict] = []
         self.current_index = 0
         self._loading = False
-        self.component_rows: Dict[str, Tuple[QCheckBox, QLineEdit]] = {}
+        self.component_rows: Dict[str, QCheckBox] = {}
         self.components = list(self.store.assigned_components(self.platform))
         try:
             self.system_types = list(self.store.list_system_type_names(self.platform))
@@ -3168,7 +3213,9 @@ class MultiSystemDialog(StyledDialog):
         self.comp_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         self.comp_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
         self.comp_table.setColumnWidth(0, 34)
-        self.comp_table.setColumnWidth(2, 76)
+        self.comp_table.setColumnWidth(2, 96)
+        self.comp_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.comp_table.itemChanged.connect(self.on_component_table_item_changed)
         self.comp_table.setMinimumHeight(330)
         mid.addWidget(self.comp_table, 1)
 
@@ -3373,6 +3420,7 @@ class MultiSystemDialog(StyledDialog):
 
     def refresh_component_table(self):
         self.component_rows.clear()
+        self.comp_table.blockSignals(True)
         self.comp_table.setRowCount(len(self.components))
         draft = self.current_draft()
         components = self._draft_components(draft)
@@ -3385,7 +3433,7 @@ class MultiSystemDialog(StyledDialog):
             cb_lay.setAlignment(Qt.AlignCenter)
             cb = QCheckBox()
             cb.setChecked(qty > 0)
-            cb.stateChanged.connect(lambda state, c=comp: self.on_component_checked(c, bool(state)))
+            cb.toggled.connect(lambda checked, c=comp: self.on_component_checked(c, checked))
             cb_lay.addWidget(cb)
             self.comp_table.setCellWidget(r, 0, cb_wrap)
 
@@ -3393,17 +3441,16 @@ class MultiSystemDialog(StyledDialog):
             name_item.setFlags(Qt.ItemIsEnabled)
             self.comp_table.setItem(r, 1, name_item)
 
-            qty_edit = QLineEdit(str(qty))
-            qty_edit.setObjectName("qtyCellInput")
-            qty_edit.setAlignment(Qt.AlignCenter)
-            qty_edit.setValidator(QIntValidator(0, 999999, qty_edit))
-            qty_edit.textChanged.connect(lambda text, c=comp: self.on_qty_changed(c, text))
-            qty_edit.editingFinished.connect(lambda c=comp: self.normalize_qty_input(c))
-            self.comp_table.setCellWidget(r, 2, qty_edit)
-            self.component_rows[comp] = (cb, qty_edit)
+            qty_item = QTableWidgetItem(str(qty))
+            qty_item.setData(Qt.UserRole, comp)
+            qty_item.setTextAlignment(Qt.AlignCenter)
+            qty_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+            self.comp_table.setItem(r, 2, qty_item)
+            self.component_rows[comp] = cb
             self.comp_table.setRowHeight(r, 36)
             self.apply_component_row_style(r, qty > 0)
         self.comp_table.setUpdatesEnabled(True)
+        self.comp_table.blockSignals(False)
         self.filter_components(self.search_input.text())
 
     def apply_component_row_style(self, row: int, selected: bool):
@@ -3414,9 +3461,10 @@ class MultiSystemDialog(StyledDialog):
             if item:
                 item.setBackground(bg)
                 item.setForeground(fg)
-        widget = self.comp_table.cellWidget(row, 0)
-        if widget:
-            widget.setStyleSheet(f"background:{bg.name()};")
+        for col in (0, 2):
+            widget = self.comp_table.cellWidget(row, col)
+            if widget:
+                widget.setStyleSheet(f"background:{bg.name()};")
 
     def component_row_index(self, comp: str) -> int:
         try:
@@ -3431,15 +3479,18 @@ class MultiSystemDialog(StyledDialog):
             draft.setdefault("components", {})[comp] = qty
         else:
             draft.setdefault("components", {}).pop(comp, None)
-        row_widgets = self.component_rows.get(comp)
-        if row_widgets:
-            cb, edit = row_widgets
+        cb = self.component_rows.get(comp)
+        if cb:
             cb.blockSignals(True)
-            edit.blockSignals(True)
             cb.setChecked(qty > 0)
-            edit.setText(str(qty))
             cb.blockSignals(False)
-            edit.blockSignals(False)
+        row = self.component_row_index(comp)
+        if row >= 0:
+            item = self.comp_table.item(row, 2)
+            if item:
+                self.comp_table.blockSignals(True)
+                item.setText(str(qty))
+                self.comp_table.blockSignals(False)
         row = self.component_row_index(comp)
         if row >= 0:
             self.apply_component_row_style(row, qty > 0)
@@ -3454,19 +3505,31 @@ class MultiSystemDialog(StyledDialog):
         current = int(self.current_draft().setdefault("components", {}).get(comp, 0) or 0)
         self.update_component_qty(comp, 1 if checked and current <= 0 else (current if checked else 0))
 
+    def on_component_table_item_changed(self, item: QTableWidgetItem):
+        if self._loading or not item or item.column() != 2:
+            return
+        comp_item = self.comp_table.item(item.row(), 1)
+        comp = str((comp_item.text() if comp_item else item.data(Qt.UserRole)) or "").strip()
+        if not comp:
+            return
+        text = str(item.text() or "").strip()
+        qty = int(text) if text.isdigit() else 0
+        if text != str(qty):
+            self.comp_table.blockSignals(True)
+            item.setText(str(qty))
+            self.comp_table.blockSignals(False)
+        self.update_component_qty(comp, qty)
+
     def on_qty_changed(self, comp: str, text: str):
         if self._loading:
             return
-        if text == "":
-            return
-        if not text.isdigit():
-            self.normalize_qty_input(comp)
-            return
-        self.update_component_qty(comp, int(text))
+        qty = int(text) if str(text or "").isdigit() else 0
+        self.update_component_qty(comp, qty)
 
     def normalize_qty_input(self, comp: str):
-        row_widgets = self.component_rows.get(comp)
-        text = row_widgets[1].text().strip() if row_widgets else ""
+        row = self.component_row_index(comp)
+        item = self.comp_table.item(row, 2) if row >= 0 else None
+        text = item.text().strip() if item else ""
         qty = int(text) if text.isdigit() else 0
         self.update_component_qty(comp, qty)
 
@@ -4885,7 +4948,8 @@ class ContractWorkWindow(QDialog):
                 return
 
         current.name = new_name
-        current.components = dict(updated.components)
+        removed_components = set(getattr(updated, "removed_components", set()) or set())
+        current.components = {k: v for k, v in dict(updated.components).items() if k not in removed_components}
         current.t0_date = updated.t0_date
         current.t0_months = updated.t0_months
         current.completion_date = updated.completion_date
@@ -4898,20 +4962,30 @@ class ContractWorkWindow(QDialog):
             self.deliveries[new_name] = old_deliveries
 
         # Bileşen seti değiştiyse teslimat satırlarını yeni sete hizala.
+        # Kaldırılan bileşenler kabullerin planned/delivered sözlüklerinden tamamen çıkarılır;
+        # böylece arayüzde görünmez ve Excel'e 0 yerine boş hücre olarak yazılır.
         comps = list(current.components.keys())
+        comp_set = set(comps)
+        self.deliveries.setdefault(new_name, [])
         for d in self.deliveries.get(new_name, []):
-            d.planned = {k: max(as_number(d.planned.get(k, 0)), 0) for k in comps}
-            d.delivered = {k: max(as_number(d.delivered.get(k, 0)), 0) for k in comps}
+            d.planned = {k: max(as_number((d.planned or {}).get(k, 0)), 0) for k in comps}
+            d.delivered = {k: max(as_number((d.delivered or {}).get(k, 0)), 0) for k in comps}
             for k in comps:
                 if d.delivered[k] > d.planned[k]:
                     d.delivered[k] = d.planned[k]
                 if d.planned[k] > current.components.get(k, 0):
                     d.planned[k] = current.components.get(k, 0)
                     d.delivered[k] = min(d.delivered[k], d.planned[k])
+            for removed_key in set((d.planned or {}).keys()) - comp_set:
+                d.planned.pop(removed_key, None)
+            for removed_key in set((d.delivered or {}).keys()) - comp_set:
+                d.delivered.pop(removed_key, None)
 
+        self.selected_system = new_name
         self.expanded_delivery_index = None
         self.refresh()
         self.system_list.setCurrentRow(r)
+        self.refresh_right()
         self._set_dirty()
 
     def delete_system(self):
@@ -5782,142 +5856,6 @@ class ContractWorkWindow(QDialog):
 
 
 
-class PerfReportDialog(QDialog):
-    """Performans kayıtlarını tablo ile gösterir."""
-    _TBL_STYLE = """
-        QTableWidget{border:0;gridline-color:#d8e4f0;background:#fff;alternate-background-color:#f6faff;}
-        QHeaderView::section{background:#eaf0f6;color:#405a7d;font-weight:800;
-            border:1px solid #d8e4f0;height:32px;padding:0 6px;}
-        QTableWidget::item{padding:4px 8px;}
-    """
-
-    def __init__(self, excel_path: Path, parent=None):
-        super().__init__(parent)
-        self.excel_path = Path(excel_path)
-        self.setWindowTitle("Performans Raporu")
-        self.setModal(True)
-        self.resize(1020, 680)
-        self.setStyleSheet(STYLE)
-        self._build()
-        self._load()
-
-    def _build(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
-        root.setSpacing(10)
-        hdr = QHBoxLayout()
-        ttl = QLabel("Performans Raporu"); ttl.setObjectName("mainTitle"); hdr.addWidget(ttl)
-        hdr.addStretch()
-        self._file_lbl = QLabel(""); self._file_lbl.setObjectName("muted"); hdr.addWidget(self._file_lbl)
-        b_ref = QPushButton("↻ Yenile"); b_ref.clicked.connect(self._load); hdr.addWidget(b_ref)
-        b_cls = QPushButton("Kapat"); b_cls.clicked.connect(self.accept); hdr.addWidget(b_cls)
-        root.addLayout(hdr)
-        self._sum_frame = QFrame(); self._sum_frame.setObjectName("panel")
-        self._sum_lay = QHBoxLayout(self._sum_frame)
-        self._sum_lay.setContentsMargins(12, 8, 12, 8); self._sum_lay.setSpacing(12)
-        root.addWidget(self._sum_frame)
-        root.addWidget(QLabel("Operasyon İstatistikleri"))
-        self._stat_tbl = QTableWidget(); self._stat_tbl.setStyleSheet(self._TBL_STYLE)
-        self._stat_tbl.setAlternatingRowColors(True); self._stat_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._stat_tbl.setSelectionBehavior(QTableWidget.SelectRows); self._stat_tbl.verticalHeader().setVisible(False)
-        root.addWidget(self._stat_tbl, 1)
-        root.addWidget(QLabel("Son 200 Kayıt (en yeni üstte)"))
-        self._log_tbl = QTableWidget(); self._log_tbl.setStyleSheet(self._TBL_STYLE)
-        self._log_tbl.setAlternatingRowColors(True); self._log_tbl.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._log_tbl.setSelectionBehavior(QTableWidget.SelectRows); self._log_tbl.verticalHeader().setVisible(False)
-        root.addWidget(self._log_tbl, 2)
-
-    def _load(self):
-        try:
-            from src.services.perf_tracker import load_records, compute_stats, file_size_mb
-            records = load_records(self.excel_path, last_n=200)
-            stats   = compute_stats(records)
-            size_mb = file_size_mb(self.excel_path)
-        except Exception:
-            return
-        self._file_lbl.setText(f"{self.excel_path.name}  ·  {size_mb} MB  ·  {len(records)} kayıt")
-        self._fill_summary(stats)
-        self._fill_stat(stats)
-        self._fill_log(records)
-
-    def _fill_summary(self, stats):
-        while self._sum_lay.count():
-            item = self._sum_lay.takeAt(0)
-            if item.widget(): item.widget().deleteLater()
-        from src.services.perf_tracker import OP_EXCEL_LOAD, OP_CONTRACT_SAVE, OP_CONTRACT_DELETE, OP_CACHE_BUILD
-        el = stats.get(OP_EXCEL_LOAD, {}); cs = stats.get(OP_CONTRACT_SAVE, {})
-        cards = [
-            ("Toplam Yükleme",  str(el.get("count", 0))),
-            ("Ort. Yükleme",    f"{el.get('avg_ms', 0):.0f} ms" if el else "—"),
-            ("Son Yükleme",     f"{el.get('last_ms', 0):.0f} ms" if el else "—"),
-            ("Ort. Kayıt",      f"{cs.get('avg_ms', 0):.0f} ms" if cs else "—"),
-        ]
-        cb = stats.get(OP_CACHE_BUILD, {})
-        if cb: cards.append(("Cache Oluşturma", f"{cb.get('avg_ms', 0):.0f} ms"))
-        for title, value in cards:
-            card = QFrame(); card.setObjectName("statCard")
-            cl = QVBoxLayout(card); cl.setContentsMargins(12, 8, 12, 8); cl.setSpacing(2)
-            tl = QLabel(title.upper()); tl.setObjectName("metaLabel")
-            vl = QLabel(value); vl.setObjectName("statValue")
-            cl.addWidget(tl); cl.addWidget(vl); self._sum_lay.addWidget(card)
-        self._sum_lay.addStretch()
-
-    def _fill_stat(self, stats):
-        from src.services.perf_tracker import OP_EXCEL_LOAD, OP_CONTRACT_SAVE, OP_CONTRACT_DELETE, OP_CACHE_BUILD
-        cols = ["Operasyon", "Adet", "Ort (ms)", "Min (ms)", "Max (ms)", "Son (ms)", "Hata"]
-        self._stat_tbl.setColumnCount(len(cols)); self._stat_tbl.setHorizontalHeaderLabels(cols)
-        self._stat_tbl.setRowCount(len(stats))
-        order = [OP_EXCEL_LOAD, OP_CACHE_BUILD, OP_CONTRACT_SAVE, OP_CONTRACT_DELETE]
-        sorted_ops = sorted(stats.keys(), key=lambda o: (order.index(o) if o in order else 99, o))
-        _disp = {"excel_load": "Excel Yükleme", "cache_build": "Cache Oluşturma",
-                 "contract_save": "Sözleşme Kayıt", "contract_delete": "Sözleşme Silme",
-                 "component_save": "Bileşen Kayıt", "user_save": "Kullanıcı Kayıt"}
-        for row, op in enumerate(sorted_ops):
-            s = stats[op]; avg = s["avg_ms"]
-            clr = "#fee2e2" if avg > 10000 else "#fef3c7" if avg > 3000 else "#dcfce7" if avg < 500 else None
-            for col, v in enumerate([_disp.get(op, op), str(s["count"]), f"{s['avg_ms']:.0f}",
-                                      f"{s['min_ms']:.0f}", f"{s['max_ms']:.0f}", f"{s['last_ms']:.0f}",
-                                      str(s["failures"]) if s["failures"] else "—"]):
-                it = QTableWidgetItem(v)
-                it.setTextAlignment(Qt.AlignCenter if col > 0 else Qt.AlignLeft | Qt.AlignVCenter)
-                if clr and col in (2, 5): it.setBackground(QColor(clr))
-                self._stat_tbl.setItem(row, col, it)
-        self._stat_tbl.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        for c in range(1, len(cols)):
-            self._stat_tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
-
-    def _fill_log(self, records):
-        cols = ["Zaman", "Operasyon", "Süre (ms)", "Durum", "Detay"]
-        self._log_tbl.setColumnCount(len(cols)); self._log_tbl.setHorizontalHeaderLabels(cols)
-        rows = list(reversed(records)); self._log_tbl.setRowCount(len(rows))
-        _disp = {"excel_load": "Excel Yükleme", "cache_build": "Cache Oluşturma",
-                 "contract_save": "Sözleşme Kayıt", "contract_delete": "Sözleşme Silme",
-                 "component_save": "Bileşen Kayıt", "user_save": "Kullanıcı Kayıt"}
-        for row, r in enumerate(rows):
-            ms = r.get("duration_ms", 0); ok = r.get("success", True)
-            detail_parts = []
-            if r.get("reused_wb") is True:   detail_parts.append("wb✓ yeniden kullanıldı")
-            if r.get("reused_wb") is False:  detail_parts.append("wb✗ yeniden yüklendi")
-            if r.get("contracts"):  detail_parts.append(f"{r['contracts']} sözleşme")
-            if r.get("platforms"):  detail_parts.append(f"{r['platforms']} platform")
-            if r.get("file_mb"):    detail_parts.append(f"{r['file_mb']} MB")
-            if r.get("ro_open_ms"): detail_parts.append(f"hızlı açma: {r['ro_open_ms']:.0f}ms")
-            if r.get("full_open_ms"): detail_parts.append(f"tam açma: {r['full_open_ms']:.0f}ms")
-            if r.get("platform"):   detail_parts.append(r["platform"])
-            if r.get("error"):      detail_parts.append(f"HATA: {r['error'][:60]}")
-            bg = "#fee2e2" if not ok else "#fef3c7" if ms > 10000 else None
-            for col, v in enumerate([str(r.get("ts",""))[:19], _disp.get(r.get("op",""), r.get("op","")),
-                                      f"{ms:.0f}", "✓" if ok else "✗",
-                                      " · ".join(detail_parts) if detail_parts else "—"]):
-                it = QTableWidgetItem(v)
-                it.setTextAlignment(Qt.AlignCenter if col in (2,3) else Qt.AlignLeft | Qt.AlignVCenter)
-                if bg: it.setBackground(QColor(bg))
-                self._log_tbl.setItem(row, col, it)
-        self._log_tbl.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
-        for c in range(4):
-            self._log_tbl.horizontalHeader().setSectionResizeMode(c, QHeaderView.ResizeToContents)
-
-
 def section_label(text):
     l = QLabel(text)
     l.setObjectName("sectionTitle")
@@ -5965,8 +5903,9 @@ class MainWindow(QMainWindow):
         self.calendar_window: Optional[ContractCalendarWindow] = None
         self._pending_select_platform: Optional[str] = None
         self.setWindowTitle(APP_TITLE)
-        if APP_ICON_PATH.exists():
-            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        icon_path = app_icon_path()
+        if icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1360, 820)
         self.setStyleSheet(STYLE)
         self.all_contract_rows = []
@@ -5986,15 +5925,25 @@ class MainWindow(QMainWindow):
             self.set_empty_state()
             self.connection_label.setText("Excel bağlı değil")
 
+    def open_usage_guide(self):
+        try:
+            dlg = UsageGuideDialog(self)
+            dlg.exec()
+        except Exception as exc:
+            traceback.print_exc()
+            QMessageBox.warning(self, "Kullanım Kılavuzu", f"Kullanım kılavuzu açılamadı:\n{exc}")
+
+
     def build(self):
         root=QWidget(); self.setCentralWidget(root); main=QVBoxLayout(root)
         main.setContentsMargins(8, 8, 8, 8)
         main.setSpacing(8)
 
         top=QFrame(); top.setObjectName("topbar"); tl=QHBoxLayout(top); tl.setContentsMargins(12, 8, 12, 8); tl.setSpacing(10)
-        if APP_ICON_PATH.exists():
+        logo_path = app_icon_path()
+        if logo_path.exists():
             logo = QLabel(); logo.setObjectName("appLogo")
-            logo.setPixmap(QPixmap(str(APP_ICON_PATH)).scaled(46, 46, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            logo.setPixmap(QPixmap(str(logo_path)).scaled(46, 46, Qt.KeepAspectRatio, Qt.SmoothTransformation))
             logo.setFixedSize(52, 52)
             logo.setAlignment(Qt.AlignCenter)
             tl.addWidget(logo)
@@ -6015,7 +5964,7 @@ class MainWindow(QMainWindow):
         self.top_actions_menu.addAction("Etiket Yönetimi", self.manage_tags)
         self.top_actions_menu.addAction("Bileşen Yönetimi", self.manage_components)
         self.top_actions_menu.addSeparator()
-        self.top_actions_menu.addAction("📊 Performans Raporu", self.show_perf_report)
+        self.top_actions_menu.addAction("📘 Kullanım Kılavuzu", self.open_usage_guide)
         self.top_actions_btn.setMenu(self.top_actions_menu)
         tl.addWidget(self.top_actions_btn)
         main.addWidget(top, 0)
@@ -6186,8 +6135,12 @@ class MainWindow(QMainWindow):
             from src.services.version_manager import read_version
             ver = read_version(self.store)
             if ver:
+                workbook_name = Path(getattr(self.store, "path", self.path)).stem
+                label_parts = [part for part in [workbook_name] if part]
+                if ver.lower() not in workbook_name.lower():
+                    label_parts.append(f"[{ver}]")
                 self.setWindowTitle(f"{APP_TITLE}  [{ver}]")
-                self.connection_label.setText(f"✓ Excel bağlı  {ver}")
+                self.connection_label.setText(f"✓ Excel bağlı  {' '.join(label_parts) or ver}")
                 self.connection_label.setProperty("status", "ok")
                 st = self.connection_label.style()
                 st.unpolish(self.connection_label)
@@ -6988,12 +6941,6 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.request_refresh(scope="ui")
 
-    def show_perf_report(self):
-        if not self.path or not self.path.exists():
-            QMessageBox.information(self, "Excel gerekli", "Önce bir Excel dosyası bağlayın.")
-            return
-        dlg = PerfReportDialog(self.path, self)
-        dlg.exec()
 
     def open_calendar_tracking(self):
         if not self.store:
@@ -7507,16 +7454,16 @@ class MainWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    configure_windows_app_identity()
     app = QApplication(sys.argv)
+    app.setApplicationName("STS")
+    app.setApplicationDisplayName("STS")
+    app.setDesktopFileName(APP_ID)
     app.setFont(QFont("Segoe UI", 10))
-    if APP_ICON_PATH.exists():
-        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+    icon_path = app_icon_path()
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     win = MainWindow()
     win.show()
-    default_path = Path(DEFAULT_FILE)
-    if default_path.exists():
-        # Pencere önce çizilsin, ağır Excel yükleme ardından worker thread'de başlasın.
-        QTimer.singleShot(0, lambda p=default_path: win.start_excel_load(p))
-    else:
-        QTimer.singleShot(0, win.open_file)
+    QTimer.singleShot(0, win.open_file)
     sys.exit(app.exec())
