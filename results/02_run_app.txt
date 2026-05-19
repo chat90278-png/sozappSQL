@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/workspace/sozappSQL/app.py", line 14, in <module>
+    from auto_accept import open_auto_accept_dialog
+  File "/workspace/sozappSQL/auto_accept.py", line 18, in <module>
+    from PySide6.QtCore import Qt, QTimer
+ModuleNotFoundError: No module named 'PySide6'
+EXIT:1
